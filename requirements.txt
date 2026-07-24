@@ -1,0 +1,19 @@
+# Dépendances du pipeline uber-tlc-pipeline
+# Installation : pip install -r requirements.txt
+
+# --- Extraction ---
+requests                 # téléchargement HTTP des fichiers Parquet TLC
+
+# --- Configuration ---
+pyyaml                   # lecture de config/config.yaml
+
+# --- Transformation ---
+pyspark                  # traitement distribué des fichiers Parquet
+pandas                   # manipulations légères et exploration
+
+# --- Google Cloud ---
+google-cloud-storage     # dépôt des fichiers bruts dans le data lake GCS
+google-cloud-bigquery    # chargement des tables dans le data warehouse
+
+# --- Orchestration ---
+apache-airflow           # ordonnancement du pipeline (DAG)

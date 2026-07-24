@@ -1,0 +1,15 @@
+# Secrets et identifiants
+.env
+credentials/
+*.json
+
+# Données (jamais versionnées)
+data/
+*.parquet
+
+# Python
+__pycache__/
+*.pyc
+py_env/
+venv/
+.ipynb_checkpoints/

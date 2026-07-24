@@ -1,0 +1,33 @@
+# Configuration du pipeline uber-tlc-pipeline.
+#
+# Ce fichier ne contient que des paramètres non sensibles.
+# Les identifiants et secrets GCP sont définis dans `.env` (voir `.env.example`).
+
+extraction:
+  # Jeu de données TLC à ingérer.
+  # Valeurs possibles : yellow_tripdata | green_tripdata | fhv_tripdata | fhvhv_tripdata
+  # (fhvhv = VTC à haut volume : Uber, Lyft…)
+  dataset: fhvhv_tripdata
+
+  # URL de base des fichiers Parquet publiés par la TLC.
+  # L'URL complète est construite ainsi :
+  #   {base_url}/{dataset}_{year}-{month}.parquet
+  base_url: https://d37ci6vzurychx.cloudfront.net/trip-data
+  
+
+  # Année à extraire
+  year: 2024
+  # Mois à extraire (format sur deux chiffres imposé par la source)
+  months:
+    - "01"
+    - "02"
+    - "03"
+
+  # Répertoire local de dépôt des fichiers bruts téléchargés
+  output_dir: data/raw
+
+  # Nombre maximal de tentatives en cas d'échec du téléchargement
+  max_retries: 3
+
+  # Délai d'attente entre deux tentatives, en secondes
+  retry_delay: 5

@@ -1,0 +1,68 @@
+# Environnement de développement du pipeline uber-tlc-pipeline.
+# Démarrage : docker-compose up --build
+#
+# Services fournis :
+#   - postgres  : base de métadonnées d'Airflow
+#   - airflow   : ordonnanceur + interface web (mode standalone, dev uniquement)
+#   - pipeline  : conteneur applicatif pour exécuter les modules à la main
+#
+# NOTE : configuration destinée au développement local. Pour la production,
+# séparer webserver / scheduler / workers et externaliser les secrets.
+
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: uber-tlc-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+
+  airflow:
+    image: apache/airflow:2.9.0-python3.10
+    container_name: uber-tlc-airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Variables du pipeline, lues depuis le fichier .env local
+      GCP_PROJECT: ${GCP_PROJECT}
+      GCS_BUCKET: ${GCS_BUCKET}
+      BQ_DATASET: ${BQ_DATASET}
+      GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/credentials/service-account.json
+    volumes:
+      - ./orchestration:/opt/airflow/dags       # DAG du pipeline
+      - ./src:/opt/airflow/src                  # code métier importé par le DAG
+      - ./config:/opt/airflow/config            # configuration YAML
+      - ./data:/opt/airflow/data                # données locales (raw / processed)
+      - ./credentials:/opt/airflow/credentials  # clé du compte de service GCP
+    ports:
+      - "8080:8080"
+    command: standalone
+
+  pipeline:
+    # Conteneur utilitaire : permet de lancer un module isolé, par exemple
+    #   docker-compose run --rm pipeline python -m src.extract.extract
+    build: .
+    container_name: uber-tlc-pipeline
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    working_dir: /app
+    # TODO : remplacer par la commande d'entrée souhaitée
+    command: ["python", "-m", "src.extract.extract"]
+
+volumes:
+  postgres-data:
