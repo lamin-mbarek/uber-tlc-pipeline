@@ -1,16 +1,4 @@
-"""Étape 2 — Dépôt des fichiers bruts dans le data lake Google Cloud Storage.
 
-Téléverse les fichiers Parquet téléchargés localement vers le bucket GCS défini
-par la variable d'environnement ``GCS_BUCKET``. Le brut est conservé tel quel :
-aucune transformation n'est appliquée à cette étape.
-
-Authentification : Application Default Credentials (ADC). Aucune clé JSON n'est
-utilisée ; les identifiants proviennent de la commande
-``gcloud auth application-default login``.
-
-Exécution autonome :
-    python -m src.load_gcs.load_gcs
-"""
 
 import os
 from pathlib import Path
@@ -78,8 +66,8 @@ def upload_to_gcs(local_dir: str = "data/raw", gcs_prefix: str = "raw") -> list[
 
         # Idempotence : on ignore un objet déjà présent et de même taille.
         if blob.exists():
-            blob.reload()  # récupère les métadonnées, dont la taille
-            if blob.size == taille_locale:
+            blob.reload()  # récupère les métadonnées, dont la taille 
+            if blob.size == taille_locale: 
                 logger.info("Déjà présent, ignoré : %s", uri)
                 uris.append(uri)
                 continue
@@ -89,15 +77,15 @@ def upload_to_gcs(local_dir: str = "data/raw", gcs_prefix: str = "raw") -> list[
             "Téléversement de %s (%.1f Mo) vers %s",
             fichier.name, taille_locale / (1024 * 1024), uri,
         )
-        # timeout élargi : les fichiers TLC peuvent peser plusieurs centaines de Mo.
+        # timeout élargi : les fichiers TLC peuvent peser plusieurs centaines de Mo. 
         blob.upload_from_filename(str(fichier), timeout=600)
 
         logger.info("Téléversé : %s", uri)
-        uris.append(uri)
+        uris.append(uri) 
 
     logger.info("Chargement GCS terminé : %d objet(s) dans le bucket.", len(uris))
-    return uris
+    return uris 
 
 
 if __name__ == "__main__":
-    upload_to_gcs()
+    upload_to_gcs() 
