@@ -1,13 +1,3 @@
-"""Étape 1 — Extraction des fichiers Parquet depuis la source NYC TLC.
-
-Télécharge les fichiers mensuels de trajets publiés par la Taxi & Limousine
-Commission et les dépose dans le répertoire local défini par la configuration
-(``extraction.output_dir``, par défaut ``data/raw/``).
-
-Exécution autonome :
-    python -m src.extract.extract
-"""
-
 import time
 from pathlib import Path
 
@@ -96,3 +86,4 @@ def extract_tlc_data(config_path: str = "config/config.yaml") -> list[str]:
 
 if __name__ == "__main__":
     extract_tlc_data()
+ 
