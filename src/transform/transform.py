@@ -1,246 +1,422 @@
-"""Étape 3 — Transformation des données TLC avec PySpark.
+"""Étape 3 — Transformation des données fhvhv lues depuis GCS.
 
-Lit les fichiers Parquet bruts, applique un nettoyage et un enrichissement, puis
-produit deux sortes de livrables :
+Spark lit les fichiers Parquet bruts (VTC à haut volume : Uber, Lyft, Via, Juno)
+directement depuis le bucket Google Cloud Storage (``gs://``), applique un
+nettoyage et un enrichissement métier, puis réécrit plusieurs tables agrégées
+dans GCS sous le préfixe ``processed`` — prêtes pour BigQuery puis Power BI.
 
-- une table de faits nettoyée (un enregistrement = un trajet) ;
-- des tables agrégées prêtes pour l'analyse et la visualisation.
+L'axe central de l'analyse est la comparaison **Uber vs Lyft** (colonne
+``plateforme``), présente dans la plupart des agrégations.
 
-Les données brutes ne sont jamais modifiées : les résultats sont écrits dans un
-répertoire de sortie distinct (``data/processed`` par défaut).
-
-Exécution autonome :
-    python -m src.transform.transform
+Prérequis :
+- Connecteur Hadoop-GCS (chargé automatiquement via spark.jars.packages).
+- Identifiants ADC accessibles (variable GOOGLE_APPLICATION_CREDENTIALS).
+- Variable GCS_BUCKET définie dans le fichier .env.
 """
 
-from pathlib import Path
+import os
 
+from dotenv import load_dotenv
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import ByteType, IntegerType, ShortType
 
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Le schéma varie selon le jeu de données TLC (fhv, fhvhv, yellow, green).
-# On déclare les noms possibles pour chaque champ logique et on résout
-# dynamiquement, en ignorant la casse.
-COLONNES_POSSIBLES = {
-    "pickup_datetime": ["pickup_datetime", "tpep_pickup_datetime", "lpep_pickup_datetime"],
-    "dropoff_datetime": ["dropoff_datetime", "dropOff_datetime", "tpep_dropoff_datetime", "lpep_dropoff_datetime"],
-    "pickup_location_id": ["pulocationid", "pickup_location_id"],
-    "dropoff_location_id": ["dolocationid", "dropoff_location_id"],
+# Connecteur GCS compatible Spark 3.5 / Hadoop 3.
+GCS_CONNECTOR = "com.google.cloud.bigdataoss:gcs-connector:hadoop3-2.2.21"
+
+# Correspondance code de licence TLC -> nom lisible de plateforme.
+PLATEFORMES = {
+    "HV0002": "Juno",
+    "HV0003": "Uber",
+    "HV0004": "Via",
+    "HV0005": "Lyft",
 }
 
-# Bornes de plausibilité d'un trajet, en minutes.
-DUREE_MIN = 1
-DUREE_MAX = 300  # 5 heures
+# Bornes de plausibilité d'un trajet.
+TRIP_TIME_MIN_S = 60      # 1 minute
+TRIP_TIME_MAX_S = 18000   # 5 heures
+TRIP_MILES_MAX = 200      # miles
 
 
 def creer_session_spark(nom_app: str = "uber-tlc-pipeline") -> SparkSession:
-    """Crée (ou récupère) la session Spark locale."""
-    return (
-        SparkSession.builder
-        .appName(nom_app)
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.driver.memory", "4g")
-        .getOrCreate()
+    """Crée une session Spark configurée pour lire et écrire sur GCS via ADC.
+
+    Le connecteur GCS est récupéré depuis Maven au premier démarrage, puis mis
+    en cache. L'authentification s'appuie sur les Application Default
+    Credentials, sans clé de compte de service.
+    """
+    # Dans le conteneur, le chemin est fourni par GOOGLE_APPLICATION_CREDENTIALS.
+    # Le repli couvre une exécution locale sous Windows.
+    adc_path = os.environ.get(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        os.path.join(
+            os.environ.get("APPDATA", ""), "gcloud",
+            "application_default_credentials.json",
+        ),
     )
 
+    builder = (
+        SparkSession.builder
+        .appName(nom_app)
+        .config("spark.jars.packages", GCS_CONNECTOR)
+        .config("spark.hadoop.fs.gs.impl",
+                "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem")
+        .config("spark.hadoop.fs.AbstractFileSystem.gs.impl",
+                "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS")
+        .config("spark.hadoop.google.cloud.auth.type", "APPLICATION_DEFAULT")
+        .config("spark.sql.session.timeZone", "UTC")
+        # Charge en priorité les classes du connecteur : évite le conflit Guava.
+        .config("spark.driver.userClassPathFirst", "true")
+        .config("spark.executor.userClassPathFirst", "true")
+        # Volume réduit : 200 partitions par défaut seraient contre-productives.
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.driver.memory", "2g")
+    )
 
-def resoudre_colonnes(df: DataFrame) -> dict[str, str]:
-    """Associe chaque champ logique au nom réel présent dans le DataFrame.
+    if os.path.exists(adc_path):
+        builder = builder.config(
+            "spark.hadoop.google.cloud.auth.service.account.json.keyfile", adc_path
+        )
+        logger.info("Identifiants ADC détectés : %s", adc_path)
+    else:
+        logger.warning(
+            "Fichier ADC introuvable (%s). Lancez "
+            "'gcloud auth application-default login'.", adc_path
+        )
+
+    return builder.getOrCreate()
+
+
+def lire_et_unifier(spark: SparkSession, source_glob: str) -> DataFrame:
+    """Lit tous les Parquet correspondant au motif et harmonise leurs schémas.
+
+    ``spark.read.option("mergeSchema", ...)`` échoue ici : d'un mois à l'autre,
+    les colonnes de zones (PULocationID / DOLocationID) sont tantôt ``INT``,
+    tantôt ``BIGINT``, et Spark refuse de fusionner ces deux types. On lit donc
+    chaque fichier séparément, on élargit tout entier 32 bits en ``long``, puis
+    on empile les DataFrames avec ``unionByName`` (tolérant aux colonnes
+    manquantes). Le volume est négligeable : les fichiers sont échantillonnés.
 
     Args:
-        df: DataFrame brut lu depuis les fichiers Parquet.
+        spark: Session Spark active.
+        source_glob: Motif GCS des fichiers à lire (``gs://bucket/raw/*.parquet``).
 
     Returns:
-        Un dictionnaire {champ_logique: nom_reel_de_colonne}.
+        Un unique DataFrame au schéma homogène.
 
     Raises:
-        ValueError: Si une colonne indispensable est introuvable.
+        FileNotFoundError: Si aucun fichier ne correspond au motif.
     """
-    # Table de correspondance insensible à la casse.
-    reelles = {c.lower(): c for c in df.columns}
-    resolues: dict[str, str] = {}
+    # Résolution du motif via le système de fichiers Hadoop (compatible gs://).
+    jvm = spark.sparkContext._jvm
+    chemin_hadoop = jvm.org.apache.hadoop.fs.Path(source_glob)
+    fs = chemin_hadoop.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration())
+    statuts = fs.globStatus(chemin_hadoop)
+    chemins = [statut.getPath().toString() for statut in statuts]
 
-    for champ, candidats in COLONNES_POSSIBLES.items():
-        for candidat in candidats:
-            if candidat.lower() in reelles:
-                resolues[champ] = reelles[candidat.lower()]
-                break
+    if not chemins:
+        raise FileNotFoundError(f"Aucun fichier Parquet trouvé pour {source_glob}")
 
-    for obligatoire in ("pickup_datetime", "dropoff_datetime"):
-        if obligatoire not in resolues:
-            raise ValueError(
-                f"Colonne '{obligatoire}' introuvable. "
-                f"Colonnes disponibles : {df.columns}"
-            )
+    logger.info("%d fichier(s) à lire et unifier.", len(chemins))
 
-    logger.info("Colonnes résolues : %s", resolues)
-    return resolues
+    # Types entiers à élargir en long pour éviter tout conflit INT/BIGINT.
+    types_a_elargir = (ByteType, ShortType, IntegerType)
+
+    dataframes: list[DataFrame] = []
+    for chemin in chemins:
+        df = spark.read.parquet(chemin)
+        for champ in df.schema.fields:
+            if isinstance(champ.dataType, types_a_elargir):
+                df = df.withColumn(champ.name, F.col(champ.name).cast("long"))
+        dataframes.append(df)
+
+    # Empilement tolérant : les colonnes absentes d'un fichier sont complétées.
+    df_unifie = dataframes[0]
+    for df in dataframes[1:]:
+        df_unifie = df_unifie.unionByName(df, allowMissingColumns=True)
+
+    return df_unifie
 
 
-def nettoyer_et_enrichir(df: DataFrame, colonnes: dict[str, str]) -> DataFrame:
-    """Nettoie les trajets et ajoute les colonnes d'analyse.
+def nettoyer_et_enrichir(df: DataFrame) -> DataFrame:
+    """Nettoie les trajets fhvhv et calcule les colonnes d'analyse.
 
-    Nettoyage : suppression des doublons, des valeurs manquantes sur les dates,
-    et des trajets de durée invalide ou aberrante.
+    Nettoyage :
+        - suppression des doublons ;
+        - lignes sans pickup/dropoff écartées ;
+        - dropoff strictement postérieur au pickup ;
+        - trip_time compris entre 60 et 18000 s (1 min à 5 h) ;
+        - trip_miles strictement positif et inférieur à 200 ;
+        - base_passenger_fare positif ou nul.
 
-    Enrichissement : durée en minutes, heure, jour de la semaine, indicateur
-    week-end, date du trajet.
+    Enrichissement : plateforme lisible, durée, temps d'attente, vitesse,
+    revenu total, taux de reversement au chauffeur, indicateurs booléens
+    (pourboire, course partagée, PMR) et dimensions temporelles.
+
+    Args:
+        df: DataFrame brut fhvhv unifié.
+
+    Returns:
+        Le DataFrame nettoyé et enrichi.
     """
-    pickup = colonnes["pickup_datetime"]
-    dropoff = colonnes["dropoff_datetime"]
-
     lignes_avant = df.count()
 
+    # --- Nettoyage ---
     df = (
         df
         .dropDuplicates()
-        .filter(F.col(pickup).isNotNull() & F.col(dropoff).isNotNull())
-        # Le trajet doit se terminer après avoir commencé.
-        .filter(F.col(dropoff) > F.col(pickup))
+        .filter(F.col("pickup_datetime").isNotNull()
+                & F.col("dropoff_datetime").isNotNull())
+        .filter(F.col("dropoff_datetime") > F.col("pickup_datetime"))
+        .filter((F.col("trip_time") >= TRIP_TIME_MIN_S)
+                & (F.col("trip_time") <= TRIP_TIME_MAX_S))
+        .filter((F.col("trip_miles") > 0) & (F.col("trip_miles") < TRIP_MILES_MAX))
+        .filter(F.col("base_passenger_fare") >= 0)
     )
 
+    # --- Plateforme lisible (Uber / Lyft / Via / Juno / Autre) ---
+    plateforme = F.lit("Autre")
+    for code, nom in PLATEFORMES.items():
+        plateforme = F.when(F.col("hvfhs_license_num") == code, nom).otherwise(plateforme)
+    df = df.withColumn("plateforme", plateforme)
+
+    # --- Colonnes dérivées ---
+    # Temps d'attente : null si request_datetime manquant ou écart négatif.
+    ecart_attente_s = (
+        F.unix_timestamp("pickup_datetime") - F.unix_timestamp("request_datetime")
+    )
     df = (
         df
+        .withColumn("duree_minutes", F.round(F.col("trip_time") / 60, 2))
         .withColumn(
-            "duree_minutes",
-            (F.unix_timestamp(dropoff) - F.unix_timestamp(pickup)) / 60,
+            "temps_attente_min",
+            F.round(
+                F.when(
+                    F.col("request_datetime").isNotNull() & (ecart_attente_s >= 0),
+                    ecart_attente_s / 60,
+                ),
+                2,
+            ),
         )
-        # Écarte les durées implausibles (capteurs défaillants, saisies erronées).
-        .filter(
-            (F.col("duree_minutes") >= DUREE_MIN)
-            & (F.col("duree_minutes") <= DUREE_MAX)
+        # Protection contre la division par zéro (trip_time >= 60 après filtrage).
+        .withColumn(
+            "vitesse_mph",
+            F.when(
+                F.col("trip_time") > 0,
+                F.round(F.col("trip_miles") / (F.col("trip_time") / 3600), 2),
+            ),
         )
-        .withColumn("date_trajet", F.to_date(F.col(pickup)))
-        .withColumn("heure", F.hour(F.col(pickup)))
+        .withColumn(
+            "revenu_total",
+            F.round(
+                F.col("base_passenger_fare")
+                + F.coalesce(F.col("tolls"), F.lit(0.0))
+                + F.coalesce(F.col("congestion_surcharge"), F.lit(0.0))
+                + F.coalesce(F.col("airport_fee"), F.lit(0.0))
+                + F.coalesce(F.col("tips"), F.lit(0.0)),
+                2,
+            ),
+        )
+        # Taux de reversement : null si le tarif de base est nul.
+        .withColumn(
+            "taux_reversement",
+            F.when(
+                F.col("base_passenger_fare") != 0,
+                F.round(F.col("driver_pay") / F.col("base_passenger_fare"), 2),
+            ),
+        )
+        .withColumn("a_pourboire", F.coalesce(F.col("tips"), F.lit(0.0)) > 0)
+        .withColumn("est_partagee",
+                    F.coalesce(F.col("shared_match_flag") == "Y", F.lit(False)))
+        .withColumn("est_pmr",
+                    F.coalesce(F.col("wav_request_flag") == "Y", F.lit(False)))
+        # --- Dimensions temporelles (depuis pickup_datetime) ---
+        .withColumn("date_trajet", F.to_date("pickup_datetime"))
+        .withColumn("annee", F.year("pickup_datetime"))
+        .withColumn("mois", F.month("pickup_datetime"))
+        .withColumn("heure", F.hour("pickup_datetime"))
         # dayofweek : 1 = dimanche ... 7 = samedi
-        .withColumn("jour_semaine", F.dayofweek(F.col(pickup)))
-        .withColumn("nom_jour", F.date_format(F.col(pickup), "EEEE"))
-        .withColumn(
-            "est_weekend",
-            F.when(F.col("jour_semaine").isin(1, 7), True).otherwise(False),
-        )
+        .withColumn("jour_semaine", F.dayofweek("pickup_datetime"))
+        .withColumn("nom_jour", F.date_format("pickup_datetime", "EEEE"))
+        .withColumn("est_weekend",
+                    F.when(F.col("jour_semaine").isin(1, 7), True).otherwise(False))
     )
 
     lignes_apres = df.count()
     logger.info(
         "Nettoyage : %d lignes en entrée, %d conservées (%.1f %% écartées).",
-        lignes_avant,
-        lignes_apres,
+        lignes_avant, lignes_apres,
         100 * (1 - lignes_apres / lignes_avant) if lignes_avant else 0,
     )
     return df
 
 
-def construire_agregations(df: DataFrame, colonnes: dict[str, str]) -> dict[str, DataFrame]:
-    """Produit les tables agrégées répondant aux questions métier."""
+def _expressions_kpi() -> list:
+    """Retourne les expressions d'agrégation des indicateurs clés.
+
+    Mutualisées entre ``kpi_globaux`` (sans regroupement) et
+    ``kpi_par_plateforme`` (regroupées par plateforme) pour garantir des
+    définitions strictement identiques.
+    """
+    return [
+        F.count("*").alias("nombre_trajets"),
+        F.round(F.sum("revenu_total"), 2).alias("revenu_total"),
+        F.round(F.avg("revenu_total"), 2).alias("revenu_moyen"),
+        F.round(F.avg("tips"), 2).alias("pourboire_moyen"),
+        F.round(F.avg("taux_reversement"), 2).alias("taux_reversement_moyen"),
+        F.round(F.avg("trip_miles"), 2).alias("distance_moyenne"),
+        F.round(F.avg("duree_minutes"), 2).alias("duree_moyenne_min"),
+        F.round(F.avg("temps_attente_min"), 2).alias("temps_attente_moyen_min"),
+        F.round(F.avg("vitesse_mph"), 2).alias("vitesse_moyenne_mph"),
+        F.round(100 * F.avg(F.col("est_partagee").cast("int")), 2).alias("part_partagee"),
+        F.round(100 * F.avg(F.col("est_pmr").cast("int")), 2).alias("part_pmr"),
+    ]
+
+
+def construire_agregations(df: DataFrame) -> dict[str, DataFrame]:
+    """Produit les tables agrégées alimentant le dashboard Power BI.
+
+    Args:
+        df: DataFrame nettoyé et enrichi.
+
+    Returns:
+        Un dictionnaire {nom_de_la_table: DataFrame agrégé}.
+    """
     agregations: dict[str, DataFrame] = {}
 
-    # Volume et durée moyenne par heure de la journée.
+    # Indicateurs clés globaux : une seule ligne.
+    agregations["kpi_globaux"] = df.agg(*_expressions_kpi())
+
+    # Table centrale de comparaison : les mêmes indicateurs par plateforme.
+    agregations["kpi_par_plateforme"] = (
+        df.groupBy("plateforme")
+        .agg(*_expressions_kpi())
+        .orderBy(F.desc("nombre_trajets"))
+    )
+
+    # Activité horaire par plateforme.
     agregations["trajets_par_heure"] = (
-        df.groupBy("heure")
+        df.groupBy("heure", "plateforme")
         .agg(
             F.count("*").alias("nombre_trajets"),
+            F.round(F.avg("revenu_total"), 2).alias("revenu_moyen"),
             F.round(F.avg("duree_minutes"), 2).alias("duree_moyenne_min"),
+            F.round(F.avg("temps_attente_min"), 2).alias("temps_attente_moyen_min"),
         )
-        .orderBy("heure")
+        .orderBy("heure", "plateforme")
     )
 
-    # Activité par jour de la semaine.
+    # Activité par jour de la semaine et plateforme.
     agregations["trajets_par_jour_semaine"] = (
-        df.groupBy("jour_semaine", "nom_jour", "est_weekend")
+        df.groupBy("jour_semaine", "nom_jour", "est_weekend", "plateforme")
         .agg(
             F.count("*").alias("nombre_trajets"),
-            F.round(F.avg("duree_minutes"), 2).alias("duree_moyenne_min"),
+            F.round(F.avg("revenu_total"), 2).alias("revenu_moyen"),
         )
-        .orderBy("jour_semaine")
+        .orderBy("jour_semaine", "plateforme")
     )
 
-    # Évolution quotidienne.
-    agregations["trajets_par_date"] = (
-        df.groupBy("date_trajet")
+    # Évolution pluriannuelle par plateforme.
+    agregations["trajets_par_annee_mois"] = (
+        df.groupBy("annee", "mois", "plateforme")
         .agg(
             F.count("*").alias("nombre_trajets"),
-            F.round(F.avg("duree_minutes"), 2).alias("duree_moyenne_min"),
+            F.round(F.sum("revenu_total"), 2).alias("revenu_total"),
+            F.round(F.avg("revenu_total"), 2).alias("revenu_moyen"),
+            F.round(F.avg("trip_miles"), 2).alias("distance_moyenne"),
         )
-        .orderBy("date_trajet")
+        .orderBy("annee", "mois", "plateforme")
     )
 
-    # Zones de prise en charge les plus fréquentées (si la colonne existe).
-    if "pickup_location_id" in colonnes:
-        pu = colonnes["pickup_location_id"]
-        agregations["zones_depart"] = (
-            df.groupBy(F.col(pu).alias("zone_id"))
-            .agg(F.count("*").alias("nombre_trajets"))
-            .orderBy(F.desc("nombre_trajets"))
+    # Revenu par zone de départ et plateforme.
+    agregations["revenu_par_zone_depart"] = (
+        df.groupBy(F.col("PULocationID").alias("zone_id"), "plateforme")
+        .agg(
+            F.count("*").alias("nombre_trajets"),
+            F.round(F.sum("revenu_total"), 2).alias("revenu_total"),
+            F.round(F.avg("revenu_total"), 2).alias("revenu_moyen"),
+            F.round(F.avg("trip_miles"), 2).alias("distance_moyenne"),
         )
+        .orderBy(F.desc("nombre_trajets"))
+    )
 
     return agregations
 
 
+# Sous-ensemble de colonnes conservé dans la table de faits (évite une table
+# trop large, tout en gardant l'essentiel pour l'analyse fine).
+COLONNES_FAITS = [
+    "plateforme",
+    "PULocationID", "DOLocationID",
+    "trip_miles", "duree_minutes", "temps_attente_min", "vitesse_mph",
+    "base_passenger_fare", "revenu_total", "tips", "driver_pay", "taux_reversement",
+    "a_pourboire", "est_partagee", "est_pmr",
+    # Dimensions temporelles (date_trajet sert de clé de partition).
+    "date_trajet", "annee", "mois", "heure", "jour_semaine", "nom_jour", "est_weekend",
+]
+
+
 def transform_data(
-    input_dir: str = "data/raw",
-    output_dir: str = "data/processed",
+    gcs_prefix_input: str = "raw",
+    gcs_prefix_output: str = "processed",
 ) -> dict[str, str]:
-    """Exécute la transformation complète des données TLC.
+    """Transforme les données fhvhv lues depuis GCS et réécrit les tables dans GCS.
 
     Args:
-        input_dir: Répertoire contenant les fichiers Parquet bruts.
-        output_dir: Répertoire de destination des données transformées.
+        gcs_prefix_input: Préfixe des fichiers bruts dans le bucket.
+        gcs_prefix_output: Préfixe de destination des données transformées.
 
     Returns:
-        Un dictionnaire {nom_de_la_table: chemin_de_sortie}.
+        Un dictionnaire {nom_de_la_table: URI GCS de sortie}.
 
     Raises:
-        FileNotFoundError: Si aucun fichier Parquet n'est trouvé en entrée.
+        EnvironmentError: Si la variable GCS_BUCKET n'est pas définie.
     """
-    source = Path(input_dir)
-    fichiers = sorted(source.glob("*.parquet"))
-    if not fichiers:
-        raise FileNotFoundError(
-            f"Aucun fichier Parquet dans {source}. Lancez d'abord l'extraction."
-        )
+    load_dotenv()
+    bucket = os.getenv("GCS_BUCKET")
+    if not bucket:
+        raise EnvironmentError("Variable GCS_BUCKET non définie dans le fichier .env.")
 
-    destination = Path(output_dir)
-    destination.mkdir(parents=True, exist_ok=True)
+    source_uri = f"gs://{bucket}/{gcs_prefix_input.strip('/')}/*.parquet"
+    base_sortie = f"gs://{bucket}/{gcs_prefix_output.strip('/')}"
 
     spark = creer_session_spark()
-    # Réduit le bruit dans la console : seuls les avertissements sont affichés.
     spark.sparkContext.setLogLevel("WARN")
 
     try:
-        logger.info("Lecture de %d fichier(s) depuis %s", len(fichiers), source)
-        df_brut = spark.read.parquet(str(source / "*.parquet"))
+        logger.info("Lecture depuis %s", source_uri)
+        # Lecture fichier par fichier avec harmonisation des types : les schémas
+        # TLC varient entre 2022 et 2024 (INT vs BIGINT sur les zones), ce que
+        # mergeSchema ne sait pas réconcilier.
+        df_brut = lire_et_unifier(spark, source_uri)
+        df_propre = nettoyer_et_enrichir(df_brut)
 
-        colonnes = resoudre_colonnes(df_brut)
-        df_propre = nettoyer_et_enrichir(df_brut, colonnes)
-
-        # Le DataFrame nettoyé est réutilisé par toutes les agrégations :
-        # on le met en cache pour éviter de tout recalculer à chaque action.
+        # Le DataFrame nettoyé alimente toutes les agrégations : on le met en
+        # cache pour éviter de recalculer le pipeline à chaque action.
         df_propre.cache()
 
         sorties: dict[str, str] = {}
 
-        # 1. Table de faits nettoyée, partitionnée par date pour les requêtes.
-        chemin_faits = destination / "trajets_nettoyes"
+        # 1. Table de faits nettoyée, partitionnée par date.
+        chemin_faits = f"{base_sortie}/trajets_nettoyes"
         (
-            df_propre.write
+            df_propre.select(*COLONNES_FAITS).write
             .mode("overwrite")
             .partitionBy("date_trajet")
-            .parquet(str(chemin_faits))
+            .parquet(chemin_faits)
         )
-        sorties["trajets_nettoyes"] = str(chemin_faits)
+        sorties["trajets_nettoyes"] = chemin_faits
         logger.info("Écrit : %s", chemin_faits)
 
-        # 2. Tables agrégées.
-        for nom, df_agrege in construire_agregations(df_propre, colonnes).items():
-            chemin = destination / nom
-            # coalesce(1) : ces tables sont petites, un seul fichier suffit.
-            df_agrege.coalesce(1).write.mode("overwrite").parquet(str(chemin))
-            sorties[nom] = str(chemin)
+        # 2. Tables agrégées (petites : un seul fichier par table).
+        for nom, df_agrege in construire_agregations(df_propre).items():
+            chemin = f"{base_sortie}/{nom}"
+            df_agrege.coalesce(1).write.mode("overwrite").parquet(chemin)
+            sorties[nom] = chemin
             logger.info("Écrit : %s", chemin)
 
         df_propre.unpersist()

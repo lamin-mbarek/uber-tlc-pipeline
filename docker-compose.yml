@@ -1,68 +1,91 @@
-# Environnement de développement du pipeline uber-tlc-pipeline.
-# Démarrage : docker-compose up --build
+# Environnement de développement : Airflow (orchestration) + Spark (traitement).
+# Airflow embarque PySpark et le connecteur GCS ; il lit les données depuis
+# gs:// grâce aux identifiants ADC montés en lecture seule.
 #
-# Services fournis :
-#   - postgres  : base de métadonnées d'Airflow
-#   - airflow   : ordonnanceur + interface web (mode standalone, dev uniquement)
-#   - pipeline  : conteneur applicatif pour exécuter les modules à la main
+# Démarrage :
+#   docker compose up -d
+#   -> Interface Airflow : http://localhost:8080  (login: airflow / airflow)
 #
-# NOTE : configuration destinée au développement local. Pour la production,
-# séparer webserver / scheduler / workers et externaliser les secrets.
+# Prérequis : avoir lancé `gcloud auth application-default login` sur l'hôte.
 
-version: "3.8"
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.airflow
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    # Chemin, DANS le conteneur, du fichier d'identifiants ADC monté depuis l'hôte.
+    GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/gcp/application_default_credentials.json
+    # Le projet GCP (adaptez si besoin ; sinon lu depuis les identifiants).
+    GCP_PROJECT: ${GCP_PROJECT:-}
+    GCS_BUCKET: ${GCS_BUCKET:-}
+  volumes:
+    # Le code du projet, monté en direct pour éditer sans reconstruire l'image.
+    - ./src:/opt/airflow/project/src
+    - ./config:/opt/airflow/project/config
+    - ./orchestration/dags:/opt/airflow/dags
+    - ./data:/opt/airflow/project/data
+    # Les identifiants ADC de l'hôte, en LECTURE SEULE.
+    - ${ADC_PATH}:/opt/airflow/gcp/application_default_credentials.json:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
 
 services:
+  # Base de métadonnées d'Airflow.
   postgres:
-    image: postgres:15
-    container_name: uber-tlc-postgres
+    image: postgres:16
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-db:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 10s
       retries: 5
+    restart: always
 
-  airflow:
-    image: apache/airflow:2.9.0-python3.10
-    container_name: uber-tlc-airflow
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      # Variables du pipeline, lues depuis le fichier .env local
-      GCP_PROJECT: ${GCP_PROJECT}
-      GCS_BUCKET: ${GCS_BUCKET}
-      BQ_DATASET: ${BQ_DATASET}
-      GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/credentials/service-account.json
-    volumes:
-      - ./orchestration:/opt/airflow/dags       # DAG du pipeline
-      - ./src:/opt/airflow/src                  # code métier importé par le DAG
-      - ./config:/opt/airflow/config            # configuration YAML
-      - ./data:/opt/airflow/data                # données locales (raw / processed)
-      - ./credentials:/opt/airflow/credentials  # clé du compte de service GCP
+  # Initialisation : migrations de la base + création de l'utilisateur admin.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username airflow --password airflow \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com || true
+    restart: on-failure
+
+  # Serveur web (l'interface).
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
     ports:
-      - "8080:8080"
-    command: standalone
+      - "8085:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8085/health"]
+      interval: 30s
+      retries: 5
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
 
-  pipeline:
-    # Conteneur utilitaire : permet de lancer un module isolé, par exemple
-    #   docker-compose run --rm pipeline python -m src.extract.extract
-    build: .
-    container_name: uber-tlc-pipeline
-    env_file:
-      - .env
-    volumes:
-      - ./:/app
-    working_dir: /app
-    # TODO : remplacer par la commande d'entrée souhaitée
-    command: ["python", "-m", "src.extract.extract"]
+  # Planificateur (exécute réellement les tâches).
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
 
 volumes:
-  postgres-data:
+  postgres-db:

@@ -1,0 +1,32 @@
+# Image Airflow enrichie de Java + PySpark pour exécuter les traitements Spark.
+FROM apache/airflow:2.10.4-python3.11
+
+USER root
+
+# Java est requis par Spark. On installe un JDK headless depuis les dépôts Debian.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends default-jdk-headless procps curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# JAVA_HOME pointe vers le JDK installé (chemin standard sous Debian).
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
+USER airflow
+
+# Dépendances Python : PySpark et les bibliothèques Google Cloud.
+# La version de PySpark est figée pour rester alignée avec le connecteur GCS.
+RUN pip install --no-cache-dir \
+    "pyspark==3.5.4" \
+    "google-cloud-storage" \
+    "google-cloud-bigquery" \
+    "pyarrow" \
+    "fsspec" \
+    "aiohttp" \
+    "requests" \
+    "pyyaml" \
+    "python-dotenv"
+
+# Rend le package `src` importable depuis les DAGs et les scripts.
+ENV PYTHONPATH=/opt/airflow/project
