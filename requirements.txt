@@ -17,3 +17,10 @@ google-cloud-bigquery    # chargement des tables dans le data warehouse
 
 # --- Orchestration ---
 apache-airflow           # ordonnancement du pipeline (DAG)
+
+# --- Dashboard (Streamlit) ---
+streamlit                # application web du dashboard interactif
+starlette<1.0            # compat. Streamlit 1.61 : starlette >=1.0 casse le middleware gzip
+plotly                   # graphiques interactifs
+db-dtypes                # conversion des types BigQuery vers pandas
+python-dotenv            # lecture du fichier .env
