@@ -10,6 +10,10 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+from pathlib import Path
+
+# Racine du projet = deux niveaux au-dessus de ce fichier (src/load_gcs/load_gcs.py)
+RACINE_PROJET = Path(__file__).resolve().parents[2]
 
 def upload_to_gcs(local_dir: str = "data/raw", gcs_prefix: str = "raw") -> list[str]:
     """Téléverse les fichiers Parquet locaux vers le bucket GCS du projet.
@@ -26,6 +30,7 @@ def upload_to_gcs(local_dir: str = "data/raw", gcs_prefix: str = "raw") -> list[
         EnvironmentError: Si la variable ``GCS_BUCKET`` n'est pas définie.
         FileNotFoundError: Si le répertoire local n'existe pas.
     """
+    
     # 1. Charger le fichier .env pour récupérer la configuration.
     load_dotenv()
 
@@ -38,7 +43,7 @@ def upload_to_gcs(local_dir: str = "data/raw", gcs_prefix: str = "raw") -> list[
     # GCP_PROJECT est facultatif : l'ADC connaît déjà le projet par défaut.
     project = os.getenv("GCP_PROJECT")
 
-    source_dir = Path(local_dir)
+    source_dir = RACINE_PROJET / local_dir
     if not source_dir.exists():
         raise FileNotFoundError(
             f"Répertoire introuvable : {source_dir}. Lancez d'abord l'extraction."
